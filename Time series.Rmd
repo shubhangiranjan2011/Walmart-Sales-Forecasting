@@ -1,0 +1,294 @@
+---
+title: "Shubhangi"
+output: pdf_document
+---
+
+```{r}
+devtools::install_github("mayer79/MetricsWeighted")
+library(readr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(gridExtra)
+library(lubridate)
+library(imputeTS)
+library(tictoc)
+library(forecast)
+```
+
+
+
+```{r}
+train <- read_csv("/Users/shubhangiranjan/Downloads/train.csv")
+
+test <- read_csv("/Users/shubhangiranjan/Downloads/test.csv")
+
+stores <- read_csv("/Users/shubhangiranjan/Downloads/stores.csv")
+
+features <- read_csv("/Users/shubhangiranjan/Downloads/features.csv")
+```
+
+
+Creating a a subset of data for EDA
+```{r}
+walmartstoresales <- merge(x=train,y=features)
+walmartstoresales <- walmartstoresales %>%
+  select(- c(IsHoliday, Dept , MarkDown1, MarkDown2, MarkDown3, MarkDown4, MarkDown5))
+```
+
+
+```{r}
+store_sales = aggregate(Weekly_Sales~Store,data=walmartstoresales, sum)
+which.max(store_sales$Weekly_Sales) # Get index position of maximum value of Weekly_Sales store_sales[which.max(store_sales$Weekly_Sales),1] # Get Store name corresponding to maximum value of Weekly_Sales
+store_sales$sales_mean<-aggregate(Weekly_Sales~Store,data=walmartstoresales, mean)$Weekly_Sales # Aggregate sales data storewise and get mean value and assign values to new variable sales_mean in store_sales 
+store_sales$sales_sd <- aggregate(Weekly_Sales~Store,data=walmartstoresales, sd)$Weekly_Sales # Agreegate sales data storewise and get standard deviation and assign values to new variable sales_sd in store_sales
+store_sales$cov = store_sales$sales_sd / store_sales$sales_mean 
+str(store_sales)
+arrange(store_sales, desc(sales_sd))
+```
+Store 20 has highest sale and Store 14 has the most varying sales.
+```{r}
+walmart_q <- walmartstoresales
+Q2_start <- as.Date("01-04-2012","%d-%m-%Y") 
+Q2_end <- as.Date("30-06-2012","%d-%m-%Y") 
+Q3_start <- as.Date("01-07-2012","%d-%m-%Y")
+Q3_end <- as.Date("30-09-2012","%d-%m-%Y")
+# Converting dates to quarter
+walmart_q$Quarter = ifelse(Q2_start<=walmart_q$Date & walmart_q$Date <= Q2_end,"Q2-2012", ifelse(Q3_start<=walmart_q$Date & walmart_q$Date < Q3_end,"Q3-2012","Other"))
+
+walmart_g <- walmart_q %>% 
+group_by(Store, Quarter) %>% 
+  summarise(Weekly_Sales = sum(Weekly_Sales)) %>% 
+  spread(Quarter, Weekly_Sales) ## spread makes the data wide
+walmart_g = data.frame(walmart_g)
+walmart_g$growth_perct = round((walmart_g$Q3.2012-walmart_g$Q2.2012)/walmart_g$Q2.2012*100,2) 
+arrange(walmart_g, desc(walmart_g$growth_perct))
+```
+Store 7 has the highest growth rate of 13.33%
+
+```{r}
+SuperBowl <- as.Date(c("2010-02-12","2011-02-11","2012-02-10","2013-02-08"))
+LabourDay <- as.Date(c("2010-09-10", "2011-09-09", "2012-09-07", "2013-09-06"))
+Thanksgiving <- as.Date(c("2010-11-26", "2011-11-25", "2012-11-23", "2013-11-29"))
+Christmas <- as.Date(c("2010-12-31", "2011-12-30", "2012-12-28", "2013-12-27"))
+walmart_h <- select(walmartstoresales,Date,Weekly_Sales)
+walmart_h$hflag <- ifelse(walmart_h$Date %in% SuperBowl, "SB", ifelse(walmart_h$Date %in% LabourDay, "LD", ifelse(walmart_h$Date %in% Thanksgiving, "TG", ifelse(walmart_h$Date %in% Christmas, "CH","None")))) 
+aggregate(Weekly_Sales~hflag,data=walmart_h, mean)
+```
+Mean sales in non-holiday season for all stores together is 1041256.4 and except Christmas all holidays have higher sales than average sale in non-holiday sale.
+
+
+
+Combining Store and Dept to form unique identifier for each department across all stores
+```{r}
+addUniqueStoreDept <- function(data){
+  mutate(data, storeDept = paste0(Store, "_", Dept),
+         .before = 1)
+}
+train_df <- addUniqueStoreDept((train))
+test_df <- addUniqueStoreDept((test))
+
+```
+
+Checking if every storeDept in test_df have historical observations in train_df and  filter out extra storeDept in train_df as we only need those present in test_df for forecasting.
+```{r}
+n_distinct(train_df$storeDept)
+
+n_distinct(test_df$storeDept)
+
+train_df <- filter(train_df, storeDept %in% unique(test_df$storeDept))
+
+n_distinct(test_df$storeDept) - n_distinct(train_df$storeDept)
+```
+
+
+```{r}
+(storeDeptNoData <- 
+    test_df %>%
+    filter(!storeDept %in% unique(train_df$storeDept)) %>%
+    .$storeDept %>%
+    unique())
+```
+
+Checking if the data has irregular time series (missing gaps between observations)
+```{r}
+startTrain <- min(train_df$Date)
+endTrain <- max(train_df$Date)
+
+startTest <- min(test_df$Date)
+endTest <- max(test_df$Date)
+
+(lengthTrain <- difftime(endTrain, startTrain, units = "weeks") + 1)
+
+(lengthTest <- difftime(endTest, startTest, units = "weeks") + 1)
+```
+
+```{r}
+obsPerStoreDept <-
+  train_df %>%
+  count(storeDept) %>%
+  arrange(n) %>%
+  rename(numObs = n)
+
+unique(obsPerStoreDept$numObs)
+```
+
+Converting irregular time series to regular time series
+
+```{r}
+trainDates <- tibble("Date" = seq(startTrain, endTrain, by = 7))
+
+mergeTS <- function(data){
+  storeDept <- unique(data$storeDept)
+  Store <- unique(data$Store)
+  Dept <- unique(data$Dept)
+  merge(data, trainDates, by = "Date", all = T) %>%
+  replace_na(list(storeDept = storeDept, 
+                  Store = Store, 
+                  Dept = Dept #, 
+                 # Weekly_Sales = 0
+                 ))
+}
+storeDept_df <-
+  train_df %>%
+  select(storeDept, Store, Dept, Date, Weekly_Sales) %>%
+  group_by(storeDept) %>%
+  do(mergeTS(.)) %>%
+  ungroup() %>%
+  arrange(Store, Dept)
+
+storeDept_df
+
+```
+
+Converting date into an mts object.
+
+```{r}
+storeDept_ts<- 
+  storeDept_df %>%
+  select(-Store, -Dept) %>%
+  pivot_wider(names_from = storeDept, values_from = Weekly_Sales) %>%
+  select(-Date) %>%
+  ts(start = decimal_date(startTrain), frequency = 52)
+
+storeDept_ts[, 1]
+```
+
+Performing interpolation on the seasonally adjusted data whenever possible (depending on the number of NA values).
+
+```{r include=FALSE}
+impute <- function(current_ts){
+ if(sum(!is.na(ts)) >= 3){
+    na_seadec(current_ts)
+ } else if(sum(!is.na(ts)) == 2){
+   na_interpolation(current_ts)
+ } else{
+   na_locf(current_ts)
+ }
+}
+for(i in 1:ncol(storeDept_ts)){
+  storeDept_ts[, i] <- impute(storeDept_ts[, i])
+} 
+
+sum(is.na(storeDept_ts))
+
+```
+
+**Model Exploration**
+
+```{r}
+# change index for different storeDept
+baseTS <- storeDept_ts[, 111] 
+baseTS_train <- baseTS %>% subset(end = 107)
+snaive_baseTS <- snaive(baseTS_train, 36)
+
+```
+
+
+```{r}
+forecast_plots <- function(ref, fc_list, model_names){
+  plt <- autoplot(ref)
+  for(i in 1:length(fc_list)){
+    plt <- plt + autolayer(fc_list[[i]], series = model_names[i], PI = F)
+  }
+  plt <- plt +  
+    ylab("Weekly_Sales") +
+    guides(color = guide_legend(title = "Forecast"))
+  plt
+}
+
+
+forecast_plots(baseTS, 
+               list(snaive_baseTS),
+               c("SNaive"))
+```
+
+Model Validation
+```{r}
+holidayWeights <- train_df %>%
+  select(Date, IsHoliday) %>%
+  unique() %>%
+  .$IsHoliday
+holidayWeights <- ifelse(holidayWeights, 5, 1)
+
+totalSize <- nrow(storeDept_ts)
+trainSize <- round(0.75 * totalSize)
+testSize <- totalSize - trainSize
+
+test_weights <- holidayWeights[(totalSize - testSize + 1):totalSize]
+train <- storeDept_ts %>% subset(end = trainSize)
+test <- storeDept_ts %>% subset(start = trainSize + 1)
+```
+
+Defining a function to compute WMAE
+```{r}
+wmae <- function(fc){
+  # rep() to replicate weights for each storeDept
+  weights <- as.vector(rep(test_weights, ncol(fc)))
+  
+  # as.vector() collapse all columns into one
+  MetricsWeighted::mae(as.vector(test), as.vector(fc), weights)
+}
+```
+
+Defining a function to generate forecasts
+```{r}
+model_fc <- function(train, h, model, ...){
+  
+  tic()
+  
+  # Initialize forecasts with zeroes
+  fc_full <- matrix(0, h, ncol(train))
+  
+  # Iterate through all storeDept to perform forecasting
+  for(i in 1:ncol(train)){
+    current_ts <- train[, i]
+    fc <- model(current_ts, h, ...)
+    fc_full[, i] <- fc
+  }
+  
+  toc()
+  
+  # Return forecasts
+  fc_full
+}
+```
+
+Seasonal Naive
+```{r}
+snaive_ <- function(current_ts, h){
+  snaive(current_ts, h = h)$mean
+}
+
+
+snaive_fc <- model_fc(train, testSize, snaive_)
+
+
+wmae_summary <- 
+  tibble("Model" = c("SNaive"),
+  "WMAE" = c(wmae(snaive_fc)))
+
+wmae_summary %>% arrange(WMAE)
+```
+
+
