@@ -1,0 +1,549 @@
+---
+title: "IS 517 final project- Walmart Sales Forecasting"
+author: "Simran Sura, Raghuvir Reddy"
+date: "4/22/2022"
+output: pdf_document
+---
+
+```{r}
+# data manipulation
+library(data.table)
+library(magrittr)
+# Data Visualization
+library(ggplot2)
+# Machine Learning
+library(caret)
+# Date functions
+library("lubridate")
+# data manipulation
+library(data.table)
+library(magrittr)
+library(dplyr)
+
+# Data Visualization
+library(ggplot2)
+
+# Machine Learning
+library(caret)
+library(xgboost)
+#library(dummies)
+#library(DiagrammeR)
+```
+
+## Loading the data
+
+```{r}
+stores <- readr::read_csv("/Users/shubhangiranjan/Downloads/stores.csv")
+dplyr::glimpse(stores)
+
+features <- readr::read_csv("/Users/shubhangiranjan/Downloads/features.csv")
+dplyr::glimpse(features)
+
+testing <- readr::read_csv("/Users/shubhangiranjan/Downloads/test.csv")
+dplyr::glimpse(testing)
+
+training <- readr::read_csv("/Users/shubhangiranjan/Downloads/train.csv")
+dplyr::glimpse(training)
+```
+
+## Data Preparation
+
+```{r}
+# left join in R using merge() function 
+# merging store, and features with train dataset
+train <- merge(x=training,y=stores)
+train <- merge(x=train,y=features)
+dim(train)
+```
+
+```{r}
+# left join in R using merge() function 
+# merging store, and features with test dataset
+test <- merge(x=testing,y=stores)
+test <- merge(x=test,y=features)
+dim(test)
+```
+
+
+```{r}
+# extract week number, year, month from date in train data
+# convert IsHoliday to factor
+train <- train %>% 
+  mutate(Year = lubridate::year(Date),
+         Month = lubridate::month(Date, label = T),
+         Week = lubridate::week(Date),
+         IsHoliday = as.factor(IsHoliday))
+
+# extract week number, year, month from date in test data
+# convert IsHoliday to factor
+test <- test %>% 
+  mutate(Year = lubridate::year(Date),
+         Month = lubridate::month(Date, label = T),
+         Week = lubridate::week(Date),
+         IsHoliday = as.factor(IsHoliday))
+```
+
+```{r}
+train$holiday_weight <- ifelse(train$IsHoliday == TRUE, 5, 1) 
+head(train)
+```
+
+
+
+## EDA
+
+Association of store type and size.
+
+```{r}
+ggplot(train, aes(x = Type, y = Size, fill= Type)) +
+  geom_boxplot() +
+  labs(title = "Stores size by type of store") +
+  ylab('Store size') +
+  theme(legend.position = "top", legend.title = element_blank())
+
+```
+
+```{r}
+min(train$Size[train$Type == 'A'])
+min(train$Size[train$Type == 'B'])
+min(train$Size[train$Type == 'C'])
+
+```
+
+It is seen that, Store type "A" as the biggest store, followed by 'B' and the smallest is the type "C" store.
+To, note there are outliers values, type "B" store has the smallest of all stores.
+Also, smallest size of stores "A" and the size of "C" types stores is same.
+
+Association of Weekly sales with year and type of store
+```{r}
+ggplot(train, aes(x = IsHoliday, y = Weekly_Sales, fill= Type)) +
+  geom_boxplot() +
+  labs(title = "Weekly sales by year and type of store") +
+  ylab('Sales') +
+  theme(legend.position = "right", 
+        legend.title = element_text()) +
+  scale_x_discrete(name = 'Is it a holiday week', 
+                   labels= c('No', 'Yes')) +
+  facet_grid(~ Year, scales="free")
+
+```
+
+Weekly sales are higher during holidays for year 2010 and 2011. There is exception present in 2012.
+
+The instances with missing values:
+  Calculation:
+  
+```{r}
+colSums(is.na(train))
+names(train)[which(colSums(is.na(train)) !=0)]
+colSums(is.na(train[,c('MarkDown1', 'MarkDown2', 'MarkDown3', 'MarkDown4', 'MarkDown5')]))
+sum(is.na(train))
+```
+
+Here, as dataset has many observations and features with NA's it makes sense to remove them.
+
+
+```{r}
+storewise <- train %>%
+  group_by(Store, Dept, Year, Month, Type, Size, IsHoliday) %>%
+  summarise(sales = sum(Weekly_Sales),
+            mean_wsales = mean(Weekly_Sales)) %>%
+  ungroup(Store) %>%
+  mutate(Store= factor(Store, levels = as.character(1:45)),
+         Dept= factor(Dept, levels = as.character(1:65)))
+
+head(storewise)
+```
+
+
+```{r}
+
+ggplot(storewise, aes(fill = IsHoliday, x = Store, y = mean_wsales)) +
+  geom_bar(stat= 'identity', position = "dodge") +
+  labs(title = "Mean sales per week by type of store and year") +
+  ylab('Mean sales per week') +
+  xlab('Stores') +
+  scale_fill_discrete(name = 'Is it a holiday week', labels = c('No', 'Yes')) +
+  theme(legend.position = "right", legend.title = element_text()) +
+  facet_grid(Year ~ Type, scales="free")
+```
+In 2012 the data of the Christmas holiday is not available and the mean weekly sales are smaller. Also, the medium stores have more weekly sales, mostly on holiday weeks in most of the cases.
+
+
+
+
+
+## Insights from EDA
+
+- Department, Store size and Type have moderate correlation with the weekly sales
+- Markdown1-5 have very weak correlation with the weekly sales, so we will leave these columns out
+- Temperature. Fuel price, CPI and Unemployment are very weakly coorelated with the weekly sales, so these columns will also be dropped out
+- IsHoliday will be considered for the further analysis as the sales in the holiday weeks are higher than in the non-holiday weeks
+- We will also leave out Month and Day as this information is already contained in the Week
+
+## Data preparation for model building
+
+- Based on the Exploratory Data Analysis and Coorelation study, the columns with weak relationship with the target column will be dropped
+- Input and Target dataframes will be created
+- Inputs will be scaled in the 0 to 1 range
+- Training and Validation datasets will be created
+- A function will be defined based on which the models performance will be measured
+
+## Feature selection: 
+### Selecting: Dept, Type, Size, Year, Week
+
+# Split the data into training and test set
+```{r}
+set.seed(123)
+training.samples <- train$Weekly_Sales %>%
+  createDataPartition(p = 0.8, list = FALSE)
+train_df  <- train[training.samples, ]
+test_df <- train[-training.samples, ]
+```
+
+```{r}
+train_data <- train_df %>% 
+  mutate_all(~ifelse(is.na(.), mean(., na.rm= T), .)) %>%
+  select(-c(Year, Month, Week, IsHoliday))
+train_data$Date <- train_df$Date
+sum(is.na(train_data))
+test_data <- test_df %>% 
+  mutate_all(~ifelse(is.na(.), mean(., na.rm= T), .)) %>%
+  select(-c(Year, Month, Week, IsHoliday))
+test_data$Date <- test_df$Date
+sum(is.na(test_data))
+```
+
+```{r}
+dim(test_data)
+dim(train_data)
+```
+
+```{r}
+sum(is.na(train_data$Size))
+```
+
+```{r}
+colnames(train_data)
+```
+
+```{r}
+library(dplyr)
+train_data <- train_data %>%
+  mutate(Store = as.character(Store),
+         Dept = as.character(Dept),
+         Year = lubridate::year(Date),
+         Month = lubridate::month(Date, label= T),
+         Week = lubridate::week(Date)) %>%
+  data.table::data.table()
+test_data <- test_data %>%
+  mutate(Store = as.character(Store),
+         Dept = as.character(Dept),
+         Year = lubridate::year(Date),
+         Month = lubridate::month(Date, label = T),
+         Week = lubridate::week(Date)) %>%
+  data.table::data.table()
+head(train_data); head(test_data)
+```
+```{r}
+sum(is.na(test_data))
+```
+
+
+## Data ready for modelling
+
+### WMAEfunction
+
+
+### Linear
+
+```{r}
+train_data_scaled <- train_data %>%
+    mutate_if(is.numeric, scale)
+
+test_data_scaled <- test_data %>%
+    mutate_if(is.numeric, scale)
+
+```
+
+
+```{r}
+require(ISLR); require(tidyverse); require(caret)
+require(ggthemes); require(broom); require(knitr)
+theme_set(theme_tufte(base_size = 14) + theme(legend.position = 'top'))
+set.seed(5)
+options(knitr.kable.NA = '')
+```
+
+```{r}
+lm.r= lm(Weekly_Sales ~ Size + Dept + Week + Year + holiday_weight,
+                        data = train_data_scaled)
+summary(lm.r)
+```
+
+```{r}
+# plot of linear model
+par(mfrow=c(2,2))
+lin.plot <- plot(lm.r)
+```
+
+```{r}
+lin.plot
+```
+
+
+```{r}
+# Predicting the Test set results
+ypred_lm = predict(lm.r, newdata = test_data_scaled)
+```
+
+```{r}
+# Visualising the Training set results
+mean((train_data_scaled$Weekly_Sales - ypred_lm) )
+#Mean Prediction Error
+mean((train_data_scaled$Weekly_Sales - ypred_lm) ^ 2)
+#Mean Squared Prediction Error
+```
+
+```{r}
+
+sqrt(mean((train_data_scaled$Weekly_Sales - ypred_lm) ^ 2))
+# RMSE of train data for linear regression
+```
+
+
+```{r}
+# the testing set results
+# Mean error, MSE, RMSE, R^2
+mean((test_data_scaled$Weekly_Sales - ypred_lm) )
+#Mean Prediction Error
+mean((test_data_scaled$Weekly_Sales - ypred_lm) ^ 2)
+#Mean Squared Prediction Error
+sqrt(mean((test_data_scaled$Weekly_Sales - ypred_lm) ^ 2))
+# RMSE of test data for linear regression
+R2(ypred_lm, test_data_scaled$Weekly_Sales)
+# R^2
+```
+
+Linear Regression (scaled)
+Test MSE: 0.3698522
+Test RMSE: 0.6081547
+
+### PLS
+
+```{r}
+# Create test and train sets including only predictors.
+wal.train.X <- data.frame(cbind(train_data$Size, train_data$Dept,
++ train_data$Week, train_data$Year, train_data$holiday_weight, train_data$Weekly_Sales ))
+
+wal.test.X <- data.frame(cbind(test_data$Size, test_data$Dept,
++ test_data$Week, test_data$Year, test_data$holiday_weight, test_data$Weekly_Sales))
+
+```
+
+### PLS Model
+
+```{r}
+trainControl <- trainControl(method = "cv", 
+                             number = 5, 
+                             returnResamp = "all")
+
+model_PLS2 <- train(Weekly_Sales ~ Size + Dept + Week + Year + holiday_weight,
+                        data = train_data_scaled,
+                    trControl = trainControl,
+                    method = "pls",
+                    preProc = c("center", "scale","pca"))
+
+# Predicting the Test set results
+ypred_pls = predict(model_PLS2, newdata = test_data_scaled)
+#Pred_PLS2 <- predict(model_PLS2,X_train_scaled)
+
+```
+
+```{r}
+# summary of pls
+summary(model_PLS2)
+```
+
+
+```{r}
+# Training Error for PLS model 
+mean((train_data_scaled$Weekly_Sales - ypred_pls) )
+#Mean Prediction Error
+mean((train_data_scaled$Weekly_Sales - ypred_pls) ^ 2)
+#Mean Squared Prediction Error
+sqrt(mean((train_data_scaled$Weekly_Sales - ypred_pls) ^ 2))
+# RMSE of train data for linear regression
+```
+
+```{r}
+# Testing Error for PLS model 
+mean((test_data_scaled$Weekly_Sales - ypred_pls) )
+#Mean Prediction Error
+mean((test_data_scaled$Weekly_Sales - ypred_pls) ^ 2)
+#Mean Squared Prediction Error
+sqrt(mean((test_data_scaled$Weekly_Sales - ypred_pls) ^ 2))
+# RMSE of test data for PLS
+R2(ypred_pls, test_data_scaled$Weekly_Sales)
+# R^2
+```
+
+Linear Regression 
+Test MSE: 0.3698522
+Test RMSE: 0.6081547
+
+PLS (scaled)
+Test MSE: 0.5385797
+Test RMSE: 0.7338799
+
+
+
+
+### pcr
+
+```{r}
+library(pls)
+```
+
+```{r}
+pcr.fit = pcr(Weekly_Sales ~ Size + Dept + Week + Year + holiday_weight,
+              data=train_data_scaled, scale=T, validation="CV")
+validationplot(pcr.fit, val.type="MSEP")
+```
+ncomp = 40
+```{r}
+pcr.pred = predict(pcr.fit, test_data_scaled, ncomp=40)
+# MSE for ncomp = 40
+mean((as.vector(test_data_scaled$Weekly_Sales) - pcr.pred) ^ 2)
+# RMSE of test data 
+sqrt(mean((as.vector(test_data_scaled$Weekly_Sales) - pcr.pred) ^ 2))
+```
+
+PCR
+
+ncomp = 40
+Test MSE: 0.6053362
+Test RMSE:0.7780335
+
+
+
+ncomp = 80
+```{r}
+pcr.pred = predict(pcr.fit, test_data_scaled, ncomp=80)
+# MSE for ncomp = 80
+mean((as.vector(test_data_scaled$Weekly_Sales) - pcr.pred) ^ 2)
+# RMSE of test data 
+sqrt(mean((as.vector(test_data_scaled$Weekly_Sales) - pcr.pred) ^ 2))
+```
+
+ncomp = 80
+Test MSE: 0.5383312
+Test RMSE:0.7337106
+
+ncomp = 60
+```{r}
+pcr.pred = predict(pcr.fit, test_data_scaled, ncomp=60)
+# MSE for ncomp = 80
+mean((as.vector(test_data_scaled$Weekly_Sales) - pcr.pred) ^ 2)
+# RMSE of test data 
+sqrt(mean((as.vector(test_data_scaled$Weekly_Sales) - pcr.pred) ^ 2))
+```
+
+ncomp = 60
+Test MSE: 0.5609994
+Test RMSE:0.7489989
+
+80 > 60 > 40
+
+### Ridge
+
+```{r}
+library(glmnet)
+```
+
+```{r}
+train.mat = model.matrix(Weekly_Sales ~ Size + Dept + Week + Year + holiday_weight,
+              data=train_data_scaled)
+test.mat = model.matrix(Weekly_Sales ~ Size + Dept + Week + Year + holiday_weight,
+              data=test_data_scaled)
+```
+
+```{r}
+grid = 10 ^ seq(4, -2, length=100)
+mod.ridge = cv.glmnet(train.mat, train_data_scaled$Weekly_Sales, alpha=0, lambda=grid, thresh=1e-12)
+lambda.best = mod.ridge$lambda.min
+lambda.best
+```
+
+Ridge Regression
+Optimal lambda value through CV: 0.01
+
+
+```{r}
+ridge.pred = predict(mod.ridge, newx=test.mat, s=lambda.best)
+# MSE
+# Test Error
+mean((test_data_scaled$Weekly_Sales - ridge.pred)^2)
+# RMSE of test data 
+sqrt(mean((test_data_scaled$Weekly_Sales - ridge.pred) ^ 2))
+```
+
+Ridge Regression
+Test MSE: 0.3701045
+Test RMSE: 0.6083621
+
+### LASSO
+
+```{r}
+mod.lasso = cv.glmnet(train.mat, train_data_scaled$Weekly_Sales, alpha=1, lambda=grid, thresh=1e-12)
+lambda.best = mod.lasso$lambda.min
+lambda.best
+```
+
+Optimal lambda value for LASSO: 0.01
+
+```{r}
+lasso.pred = predict(mod.lasso, newx=test.mat, s=lambda.best)
+# Test Error
+mean((test_data_scaled$Weekly_Sales - lasso.pred)^2)
+# RMSE of test data 
+sqrt(mean((test_data_scaled$Weekly_Sales - lasso.pred) ^ 2))
+```
+
+LASSO Regression
+Test MSE: 0.3806734
+Test RMSE: 0.6169873
+
+Slightly worse than Ridge.
+
+```{r}
+mod.lasso = glmnet(model.matrix(Weekly_Sales ~ Size + Dept + Week + Year + holiday_weight, data=train_data_scaled), train_data_scaled$Weekly_Sales, alpha=1)
+predict(mod.lasso, s=lambda.best, type="coefficients")
+```
+
+
+```{r}
+rf <- train(Weekly_Sales ~ Size + Dept + Week + Year + holiday_weight, 
+                data = train_data_scaled, 
+                num.trees= 10,
+                tuneGrid = expand.grid(min.node.size = c(5, 7, 9), mtry = c(5, 10),
+                                       splitrule = c('extratrees', 'variance')),
+                trControl = trainControl("cv", number = 2),
+                weights = holiday_weight,
+                method = "ranger"
+                )
+
+plot(rf)
+rf$bestTune
+summary(rf$finalModel)
+rf$results
+```
+
+```{r}
+rf$results[which(rf$results$RMSE == min(rf$results$RMSE)),]
+```
+
+```{r}
+
+predictions2 <- rf %>% predict(test_data_scaled)
+```
